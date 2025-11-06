@@ -1,0 +1,6 @@
+# Dependencias mínimas para usar `serving.py`
+# Instala con: pip install -r requirements.txt
+tensorflow==2.18.0
+# numpy suele venir con tensorflow, pero se incluye por si acaso
+numpy==1.26.4
+
