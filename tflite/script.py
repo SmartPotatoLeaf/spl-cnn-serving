@@ -10,7 +10,8 @@ def keras2tflite(
     filepath: str,
     outfile_path: Optional[str] = None,
     overwrite: bool = False,
-    optimization_level: str = "default"
+    optimization_level: str = "default",
+    representative_data_dir: Optional[str] = None
 ) -> str:
     """
     Converts a Keras model file (.keras) to an optimized TFLite model for mobile devices.
@@ -25,6 +26,9 @@ def keras2tflite(
                                - 'float16': Float16 quantization (smaller, faster, minimal accuracy loss)
                                - 'int8': Dynamic range quantization (good balance)
                                - 'int8_full': Full integer quantization (smallest, requires representative dataset)
+    :param representative_data_dir: Directory containing representative images for int8_full quantization.
+                                    Should contain real images (from validation/test set).
+                                    If None and int8_full is used, random data will be used (not recommended).
 
     :raises FileNotFoundError: If no Keras model file is found.
     :raises FileExistsError: If the output file exists and overwrite is False.
@@ -53,7 +57,29 @@ def keras2tflite(
     try:
         print(f"Loading Keras model from: {p_keras}")
         model: tf.keras.Model = tf.keras.models.load_model(str(p_keras), compile=False)
-        print(f"Model loaded successfully. Input shape: {model.input_shape}")
+
+        # Display model information
+        print(f"\nModel loaded successfully!")
+        print(f"Model type: {'Multi-output (Multitask)' if isinstance(model.output, list) else 'Single-output'}")
+
+        # Handle both single and multiple inputs
+        if isinstance(model.input, list):
+            print(f"Number of inputs: {len(model.input)}")
+            for i, inp in enumerate(model.input):
+                print(f"  Input {i}: {inp.shape}")
+        else:
+            print(f"Input shape: {model.input.shape}")
+
+        # Handle both single and multiple outputs
+        if isinstance(model.output, list):
+            print(f"Number of outputs: {len(model.output)}")
+            for i, out in enumerate(model.output):
+                print(f"  Output {i}: {out.shape}")
+        else:
+            print(f"Output shape: {model.output.shape}")
+
+        print()
+
     except Exception as e:
         raise RuntimeError(f"Cannot load the keras file {p_keras}: {e}")
 
@@ -85,20 +111,96 @@ def keras2tflite(
 
             # Generate representative dataset for full int8 quantization
             def representative_dataset_gen():
-                # Get input shape from model
-                input_shape = model.input_shape
-                # Generate sample data (you should replace this with real data samples)
-                for _ in range(100):
-                    # Generate random data matching the input shape
-                    # Note: batch dimension is None, so we use 1
-                    sample_shape = [1 if dim is None else dim for dim in input_shape]
-                    data = np.random.rand(*sample_shape).astype(np.float32)
-                    yield [data]
+                # Get input shape from model (handle both single and multiple inputs)
+                if isinstance(model.input, list):
+                    input_shape = model.input[0].shape  # Use first input
+                else:
+                    input_shape = model.input.shape
+
+                # Extract dimensions (batch, height, width, channels)
+                sample_shape = [1 if dim is None else dim for dim in input_shape]
+                target_height, target_width = sample_shape[1], sample_shape[2]
+
+                print(f"Calibration input shape: {sample_shape} (H={target_height}, W={target_width})")
+
+                if representative_data_dir is not None:
+                    # Load real images from directory
+                    data_path = Path(representative_data_dir)
+                    if not data_path.exists():
+                        print(f"WARNING: Representative data directory not found: {representative_data_dir}")
+                        print("WARNING: Using random data instead (not recommended)")
+                        # Fallback to random data
+                        for _ in range(100):
+                            data = np.random.rand(*sample_shape).astype(np.float32)
+                            yield [data]
+                        return
+
+                    # Find all image files
+                    image_extensions = {'.jpg', '.jpeg', '.png', '.bmp'}
+                    image_files = [f for f in data_path.rglob('*')
+                                   if f.suffix.lower() in image_extensions]
+
+                    if not image_files:
+                        print(f"WARNING: No images found in {representative_data_dir}")
+                        print("WARNING: Using random data instead (not recommended)")
+                        for _ in range(100):
+                            data = np.random.rand(*sample_shape).astype(np.float32)
+                            yield [data]
+                        return
+
+                    print(f"Found {len(image_files)} images for calibration")
+                    # Use up to 200 images for calibration (more is better but slower)
+                    num_samples = min(200, len(image_files))
+
+                    for i, img_path in enumerate(image_files[:num_samples]):
+                        try:
+                            # Load and preprocess image
+                            img = tf.keras.preprocessing.image.load_img(
+                                str(img_path),
+                                target_size=(target_height, target_width)
+                            )
+                            img_array = tf.keras.preprocessing.image.img_to_array(img)
+
+                            # Normalize to [0, 1] range
+                            # For segmentation models, typically use [0, 1] normalization
+                            # If your model uses different preprocessing (e.g., ImageNet normalization),
+                            # you should adjust this accordingly
+                            img_array = img_array / 255.0
+
+                            # Add batch dimension
+                            img_array = np.expand_dims(img_array, axis=0).astype(np.float32)
+
+                            yield [img_array]
+
+                            if (i + 1) % 50 == 0:
+                                print(f"  Processed {i + 1}/{num_samples} calibration images...")
+                        except Exception as e:
+                            print(f"  WARNING: Could not load image {img_path}: {e}")
+                            continue
+
+                    print(f"Calibration complete using {num_samples} images")
+                else:
+                    # No representative data provided - use random data (not recommended)
+                    print("WARNING: No representative data directory provided!")
+                    print("WARNING: Using random data for calibration (accuracy may be affected)")
+                    print("RECOMMENDATION: Use --repr-data flag with a directory of real images")
+                    for _ in range(100):
+                        data = np.random.rand(*sample_shape).astype(np.float32)
+                        yield [data]
 
             converter.representative_dataset = representative_dataset_gen
             converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-            converter.inference_input_type = tf.uint8  # or tf.int8
-            converter.inference_output_type = tf.uint8  # or tf.int8
+
+            # For multi-output segmentation models, it's often better to keep outputs as float
+            # to maintain accuracy, especially for pixel-wise predictions
+            is_multi_output = isinstance(model.output, list)
+            if is_multi_output:
+                print("Multi-output model detected: keeping output types as float for better accuracy")
+                # Don't set inference_input_type and inference_output_type for multi-output models
+                # This allows the converter to handle each output appropriately
+            else:
+                converter.inference_input_type = tf.uint8
+                converter.inference_output_type = tf.uint8
 
         else:
             raise ValueError(
@@ -162,8 +264,14 @@ Examples:
   # Basic conversion with float16 quantization (recommended)
   python tflite/script.py -k resources/models/SmartPotatoLeaf_ResNet50.keras -opt float16
   
-  # Full integer quantization for maximum optimization
-  python tflite/script.py -k resources/models/SmartPotatoLeaf_ResNet50.keras -opt int8_full -o model_int8.tflite --overwrite
+  # Full integer quantization with representative data (best optimization)
+  python tflite/script.py -k resources/models/SmartPotatoLeaf_ResNet50.keras -opt int8_full -r path/to/validation_images --overwrite
+  
+  # Dynamic range int8 quantization (no representative data needed)
+  python tflite/script.py -k resources/models/SmartPotatoLeaf_ResNet50.keras -opt int8 --overwrite
+
+Note: For int8_full, use --repr-data to point to a directory with validation/test images.
+      This ensures better calibration and maintains model accuracy.
         """
     )
     p.add_argument(
@@ -185,6 +293,14 @@ Examples:
         help='Optimization level (default: float16)'
     )
     p.add_argument(
+        '--repr-data', '-r',
+        required=False,
+        default=None,
+        help='Directory containing representative images for int8_full calibration. '
+             'Should contain real images from validation/test set. '
+             'Required for best results with int8_full optimization.'
+    )
+    p.add_argument(
         '--overwrite',
         action='store_true',
         help='Overwrite the output file if it exists.'
@@ -202,7 +318,8 @@ def main(argv=None):
             args.keras,
             args.output,
             overwrite=args.overwrite,
-            optimization_level=args.optimization
+            optimization_level=args.optimization,
+            representative_data_dir=args.repr_data
         )
         print(f"✓ TFLite model successfully created at: {out}")
     except Exception as e:
