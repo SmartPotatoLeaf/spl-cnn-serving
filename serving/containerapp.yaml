@@ -1,0 +1,36 @@
+location: westus
+name: spl-cnn-serving
+properties:
+  configuration:
+    activeRevisionsMode: Single
+    ingress:
+      additionalPortMappings:
+      - exposedPort: 8500
+        external: false
+        targetPort: 8500
+      allowInsecure: false
+      external: true
+      targetPort: 8501
+      traffic:
+      - latestRevision: true
+        weight: 100
+      transport: http
+  managedEnvironmentId: <env id>
+  template:
+    containers:
+    - image: yoimerdr/spl-cnn-serving:1.1.1
+      name: spl-cnn-serving
+      resources:
+        cpu: 2.0
+        memory: 4.0Gi
+    scale:
+      maxReplicas: 5
+      minReplicas: 0
+      rules:
+      - name: http-scale
+        http:
+          metadata:
+            concurrentRequests: "10"
+  workloadProfileName: Consumption
+resourceGroup: spl
+type: Microsoft.App/containerApps
